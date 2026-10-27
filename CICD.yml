@@ -1,0 +1,204 @@
+name: Python CI/CD
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+      - staging
+    tags:
+      - "v*"
+
+  pull_request:
+    branches:
+      - main
+      - staging
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Install dependencies and run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov build
+
+      - name: Run tests
+        run: |
+          pytest --cov=. --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  build:
+    name: Build application package
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build Python package
+        run: python -m build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package
+          path: dist/*
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: build
+    if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: staging
+
+    env:
+      SECUREGATE_URL: ${{ secrets.SECUREGATE_URL }}
+      STAGING_HOST: ${{ secrets.STAGING_HOST }}
+      STAGING_USER: ${{ secrets.STAGING_USER }}
+      STAGING_SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
+      STAGING_DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package
+          path: dist
+
+      - name: Validate required staging secrets
+        run: |
+          if [ -z "$SECUREGATE_URL" ]; then
+            echo "::error::SECUREGATE_URL GitHub secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$STAGING_HOST" ] || [ -z "$STAGING_USER" ] || [ -z "$STAGING_SSH_KEY" ] || [ -z "$STAGING_DEPLOY_PATH" ]; then
+            echo "::error::One or more staging deployment secrets are missing."
+            exit 1
+          fi
+
+          echo "Required staging secrets are configured."
+
+      - name: Deploy to staging server
+        run: |
+          mkdir -p ~/.ssh
+          echo "$STAGING_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$STAGING_HOST" >> ~/.ssh/known_hosts
+
+          scp -i ~/.ssh/id_ed25519 dist/* "$STAGING_USER@$STAGING_HOST:$STAGING_DEPLOY_PATH/"
+
+          ssh -i ~/.ssh/id_ed25519 "$STAGING_USER@$STAGING_HOST" "
+            cd '$STAGING_DEPLOY_PATH' &&
+            python -m pip install --upgrade pip &&
+            python -m pip install --no-cache-dir . &&
+            sudo systemctl restart python-app-staging
+          "
+
+      - name: Confirm staging deployment
+        run: |
+          echo "Staging deployment completed using SecureGate."
+          echo "SecureGate URL is configured."
+
+  deploy-production:
+    name: Deploy to production
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+
+    env:
+      SECUREGATE_URL: ${{ secrets.SECUREGATE_URL }}
+      PRODUCTION_HOST: ${{ secrets.PRODUCTION_HOST }}
+      PRODUCTION_USER: ${{ secrets.PRODUCTION_USER }}
+      PRODUCTION_SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+      PRODUCTION_DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+      PRODUCTION_API_TOKEN: ${{ secrets.PRODUCTION_API_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package
+          path: dist
+
+      - name: Validate required production secrets
+        run: |
+          if [ -z "$SECUREGATE_URL" ]; then
+            echo "::error::SECUREGATE_URL GitHub secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$PRODUCTION_HOST" ] || [ -z "$PRODUCTION_USER" ] || [ -z "$PRODUCTION_SSH_KEY" ] || [ -z "$PRODUCTION_DEPLOY_PATH" ]; then
+            echo "::error::One or more production deployment secrets are missing."
+            exit 1
+          fi
+
+          if [ -z "$PRODUCTION_API_TOKEN" ]; then
+            echo "::error::PRODUCTION_API_TOKEN GitHub secret is missing."
+            exit 1
+          fi
+
+          echo "Required production secrets are configured."
+
+      - name: Deploy to production server
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PRODUCTION_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$PRODUCTION_HOST" >> ~/.ssh/known_hosts
+
+          scp -i ~/.ssh/id_ed25519 dist/* "$PRODUCTION_USER@$PRODUCTION_HOST:$PRODUCTION_DEPLOY_PATH/"
+
+          ssh -i ~/.ssh/id_ed25519 "$PRODUCTION_USER@$PRODUCTION_HOST" "
+            cd '$PRODUCTION_DEPLOY_PATH' &&
+            python -m pip install --upgrade pip &&
+            python -m pip install --no-cache-dir . &&
+            sudo systemctl restart python-app-production
+          "
+
+      - name: Confirm production deployment
+        run: |
+          echo "Production deployment completed using SecureGate."
+          echo "SecureGate URL is configured."
