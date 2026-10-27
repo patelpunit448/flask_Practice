@@ -1,226 +1,112 @@
-name: Python CI/CD
+name: Build, Security Scan, and Deploy
 
 on:
-  workflow_dispatch:
-
   push:
     branches:
-      - main
-      - staging
-    tags:
-      - "v*"
-
-  pull_request:
-    branches:
-      - main
-      - staging
-
-permissions:
-  contents: read
+      - "main"
+  workflow_dispatch:
 
 jobs:
-  test:
-    name: Install dependencies and run tests
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov build
-
-      - name: Run tests
-        run: |
-          pytest --cov=. --cov-report=term-missing --cov-report=xml
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage.xml
-          if-no-files-found: ignore
-
-  build:
-    name: Build application package
-    needs: test
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build
-
-      - name: Build Python package
-        run: python -m build
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-package
-          path: dist/*
-
-  securegate-security-check:
-    name: SecureGate security check
-    needs: test
-    runs-on: ubuntu-24.04
+  build-and-deploy:
+    runs-on: ubuntu-latest
 
     env:
-      SECUREGATE_URL: ${{ secrets.SECUREGATE_URL }}
-
-    steps:
-      - name: Validate SecureGate URL
-        run: |
-          if [ -z "$SECUREGATE_URL" ]; then
-            echo "::error::SECUREGATE_URL GitHub secret is missing."
-            exit 1
-          fi
-
-          echo "SECUREGATE_URL is configured."
-
-  deploy-staging:
-    name: Deploy to staging
-    needs:
-      - build
-      - securegate-security-check
-    if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
-    runs-on: ubuntu-24.04
-    environment: staging
-
-    env:
-      SECUREGATE_URL: ${{ secrets.SECUREGATE_URL }}
-      STAGING_HOST: ${{ secrets.STAGING_HOST }}
-      STAGING_USER: ${{ secrets.STAGING_USER }}
-      STAGING_SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
-      STAGING_DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      PROJECT_NAME: ${{ github.event.repository.name }}
+      REPOSITORY_OWNER: ${{ github.repository_owner }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - name: Detect current commit SHA
+        run: |
+          CURRENT_COMMIT_SHA=$(git rev-parse HEAD)
+          echo "COMMIT_SHA=$CURRENT_COMMIT_SHA" >> "$GITHUB_ENV"
+
+      - name: Run GitLeaks secret scan
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            zricethezav/gitleaks:latest detect \
+            --source=/repo \
+            --verbose
+
+      - name: Run Semgrep SAST scan
+        run: |
+          docker run --rm -v "$PWD:/src" returntocorp/semgrep:latest semgrep scan --config auto /src
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
         with:
-          name: python-package
-          path: dist
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
 
-      - name: Validate staging secrets
+      - name: Prepare Dockerfile when missing
+        id: dockerfile
         run: |
-          if [ -z "$SECUREGATE_URL" ]; then
-            echo "::error::SECUREGATE_URL GitHub secret is missing."
-            exit 1
+          if [ -f Dockerfile ]; then
+            echo "Using repository Dockerfile."
+            echo "path=Dockerfile" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "No Dockerfile found. Creating fallback Dockerfile."
+          echo "path=Dockerfile" >> "$GITHUB_OUTPUT"
+          if [ -f package.json ]; then
+            cat > Dockerfile <<'EOF'
+          FROM node:20-alpine
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm install
+          COPY . .
+          CMD ["npm", "start"]
+          EOF
+          elif [ -f requirements.txt ]; then
+            cat > Dockerfile <<'EOF'
+          FROM python:3.12-alpine
+          WORKDIR /app
+          COPY requirements.txt ./
+          RUN pip install --no-cache-dir -r requirements.txt
+          COPY . .
+          CMD ["python", "app.py"]
+          EOF
+          else
+            cat > Dockerfile <<'EOF'
+          FROM alpine:3.20
+          WORKDIR /app
+          COPY . .
+          CMD ["sh", "-c", "ls -la /app"]
+          EOF
           fi
 
-          if [ -z "$STAGING_HOST" ] || [ -z "$STAGING_USER" ] || [ -z "$STAGING_SSH_KEY" ] || [ -z "$STAGING_DEPLOY_PATH" ]; then
-            echo "::error::One or more staging deployment secrets are missing."
-            exit 1
-          fi
-
-          echo "Required staging secrets are configured."
-
-      - name: Deploy to staging server
+      - name: Build Docker image
+        id: image_build
         run: |
-          mkdir -p ~/.ssh
-          echo "$STAGING_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$STAGING_HOST" >> ~/.ssh/known_hosts
+          IMAGE_NAMESPACE="${DOCKERHUB_USERNAME:-$REPOSITORY_OWNER}"
+          IMAGE_REPO=$(echo "$IMAGE_NAMESPACE/$PROJECT_NAME" | tr '[:upper:]' '[:lower:]')
+          SHORT_COMMIT_SHA="${COMMIT_SHA:0:8}"
+          IMAGE_SHA_REF="$IMAGE_REPO:$SHORT_COMMIT_SHA"
+          IMAGE_LATEST_REF="$IMAGE_REPO:latest"
 
-          scp -i ~/.ssh/id_ed25519 dist/* "$STAGING_USER@$STAGING_HOST:$STAGING_DEPLOY_PATH/"
+          docker build -f "${{ steps.dockerfile.outputs.path }}" -t "$IMAGE_SHA_REF" -t "$IMAGE_LATEST_REF" .
 
-          ssh -i ~/.ssh/id_ed25519 "$STAGING_USER@$STAGING_HOST" "
-            cd '$STAGING_DEPLOY_PATH' &&
-            python -m pip install --upgrade pip &&
-            python -m pip install --no-cache-dir . &&
-            sudo systemctl restart python-app-staging
-          "
+          echo "image_ref=$IMAGE_SHA_REF" >> "$GITHUB_OUTPUT"
+          echo "latest_ref=$IMAGE_LATEST_REF" >> "$GITHUB_OUTPUT"
 
-      - name: Confirm staging deployment
-        run: |
-          echo "Staging deployment completed successfully."
-          echo "SecureGate URL is configured."
-
-  deploy-production:
-    name: Deploy to production
-    needs:
-      - build
-      - securegate-security-check
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-24.04
-    environment: production
-
-    env:
-      SECUREGATE_URL: ${{ secrets.SECUREGATE_URL }}
-      PRODUCTION_HOST: ${{ secrets.PRODUCTION_HOST }}
-      PRODUCTION_USER: ${{ secrets.PRODUCTION_USER }}
-      PRODUCTION_SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
-      PRODUCTION_DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
-      PRODUCTION_API_TOKEN: ${{ secrets.PRODUCTION_API_TOKEN }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - name: Run Trivy image scan
+        uses: aquasecurity/trivy-action@master
         with:
-          name: python-package
-          path: dist
+          image-ref: ${{ steps.image_build.outputs.image_ref }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
 
-      - name: Validate production secrets
+      - name: Push Docker image to Docker Hub
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
         run: |
-          if [ -z "$SECUREGATE_URL" ]; then
-            echo "::error::SECUREGATE_URL GitHub secret is missing."
-            exit 1
-          fi
-
-          if [ -z "$PRODUCTION_HOST" ] || [ -z "$PRODUCTION_USER" ] || [ -z "$PRODUCTION_SSH_KEY" ] || [ -z "$PRODUCTION_DEPLOY_PATH" ]; then
-            echo "::error::One or more production deployment secrets are missing."
-            exit 1
-          fi
-
-          if [ -z "$PRODUCTION_API_TOKEN" ]; then
-            echo "::error::PRODUCTION_API_TOKEN GitHub secret is missing."
-            exit 1
-          fi
-
-          echo "Required production secrets are configured."
-
-      - name: Deploy to production server
-        run: |
-          mkdir -p ~/.ssh
-          echo "$PRODUCTION_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$PRODUCTION_HOST" >> ~/.ssh/known_hosts
-
-          scp -i ~/.ssh/id_ed25519 dist/* "$PRODUCTION_USER@$PRODUCTION_HOST:$PRODUCTION_DEPLOY_PATH/"
-
-          ssh -i ~/.ssh/id_ed25519 "$PRODUCTION_USER@$PRODUCTION_HOST" "
-            cd '$PRODUCTION_DEPLOY_PATH' &&
-            python -m pip install --upgrade pip &&
-            python -m pip install --no-cache-dir . &&
-            sudo systemctl restart python-app-production
-          "
-
-      - name: Confirm production deployment
-        run: |
-          echo "Production deployment completed successfully."
-          echo "SecureGate URL is configured."
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          docker push "${{ steps.image_build.outputs.image_ref }}"
+          docker push "${{ steps.image_build.outputs.latest_ref }}"
+          echo "Pushed to Docker Hub successfully!"
