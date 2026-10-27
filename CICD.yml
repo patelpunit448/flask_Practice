@@ -21,7 +21,7 @@ permissions:
 jobs:
   test:
     name: Install dependencies and run tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -53,7 +53,7 @@ jobs:
   build:
     name: Build application package
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -79,11 +79,31 @@ jobs:
           name: python-package
           path: dist/*
 
+  securegate-security-check:
+    name: SecureGate security check
+    needs: test
+    runs-on: ubuntu-24.04
+
+    env:
+      SECUREGATE_URL: ${{ secrets.SECUREGATE_URL }}
+
+    steps:
+      - name: Validate SecureGate URL
+        run: |
+          if [ -z "$SECUREGATE_URL" ]; then
+            echo "::error::SECUREGATE_URL GitHub secret is missing."
+            exit 1
+          fi
+
+          echo "SECUREGATE_URL is configured."
+
   deploy-staging:
     name: Deploy to staging
-    needs: build
+    needs:
+      - build
+      - securegate-security-check
     if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: staging
 
     env:
@@ -103,7 +123,7 @@ jobs:
           name: python-package
           path: dist
 
-      - name: Validate required staging secrets
+      - name: Validate staging secrets
         run: |
           if [ -z "$SECUREGATE_URL" ]; then
             echo "::error::SECUREGATE_URL GitHub secret is missing."
@@ -135,14 +155,16 @@ jobs:
 
       - name: Confirm staging deployment
         run: |
-          echo "Staging deployment completed using SecureGate."
+          echo "Staging deployment completed successfully."
           echo "SecureGate URL is configured."
 
   deploy-production:
     name: Deploy to production
-    needs: build
+    needs:
+      - build
+      - securegate-security-check
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: production
 
     env:
@@ -163,7 +185,7 @@ jobs:
           name: python-package
           path: dist
 
-      - name: Validate required production secrets
+      - name: Validate production secrets
         run: |
           if [ -z "$SECUREGATE_URL" ]; then
             echo "::error::SECUREGATE_URL GitHub secret is missing."
@@ -200,5 +222,5 @@ jobs:
 
       - name: Confirm production deployment
         run: |
-          echo "Production deployment completed using SecureGate."
+          echo "Production deployment completed successfully."
           echo "SecureGate URL is configured."
